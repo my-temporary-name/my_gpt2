@@ -7,6 +7,29 @@ from torch.nn import functional as F
 # From original transformer model gpt2 only have decoder part and also the cross-attention is not used.
 # Also there's reshuffling layer-norms and Additional Layer normalization is added right before the soft-max layer.
 
+class CausalSelfAttention(nn.Module): # this class combined the self-attention mechanism and multi-head attention mechanism in one class
+
+    def __init__(self, config):
+        super().__init__()
+
+        assert config.n_emb % config.n_head == 0 # n_emb is the embedding size and n_head is the number of heads in the multi-head attention mechanism 
+                                                 # (so the embedding size should be divisible by the number of heads)
+        self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd) # Linear layer for the query, key and value projections for all heads, but in batch
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd) # Linear layer for the final output projection
+        # Regularization
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1,1,config.block_size, config.block_size)) # Lower triangular matrix for masking future tokens
+    
+    def forward(self,x):
+        B, T, C = x.size() # batch size, Sequence length, Embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dimension
+        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
+        # eg: in GPT-2 (124M), n_head=12, hs=64, so nh*hs = C = 768 channels in Transformer (channels is also called as hidden size)
+        
+
 
 class MLP(nn.Module):
 
