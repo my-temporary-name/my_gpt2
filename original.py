@@ -39,7 +39,7 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         #add2
         att = (q@k.transpose(-2,-1))*(1.0 / math.sqrt(k.size(-1))) # Multiplying the query and key and scaling it by the square root of the key size
-        att = att.masked_fill(self.bias[:,:,:T,:T]==0, float(-'inf')) # Masking the future tokens
+        att = att.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf')) # Masking the future tokens
         att = F.softmax(att, dim=-1) # Softmax over the last dimension
 
         y = att@v
@@ -188,8 +188,55 @@ class GPT(nn.Module):
 
         return model
     
+num__return_sequences = 5
+max_length = 30
+
+
 model = GPT.from_pretrained('gpt2') # Load the pretrained GPT2 model
 print("Model loaded successfully!")
+# print(model)
+
+model.eval() # Set the model to evaluation mode
+model.to('cuda')
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I am NLP student in IIT") 
+tokens = torch.tensor(tokens, dtype = torch.long) # (8,) # Encoding the input text
+tokens = tokens.unsqueeze(0).repeat(num__return_sequences, 1) # (5,8) # Repeating the input text for the number of sequences to generate
+x = tokens.to('cuda') # Moving the input to the GPU
+
+# Generate! right now x is (B,T) where B=5 and T=8
+# set see to 42
+torch.manual_seed(42)
+torch.cuda.manual_seed(42) 
+
+while x.size(1) < max_length: # Generate the tokens until the maximum length is reached
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits = model(x) # (5,8,50257) # Getting the logits from the model # (B,T, vocab_size)
+        # take logits as the last position
+        logits = logits[:, -1, :] # (5,50257) # Taking the logits of the last position # (B,vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1) # (5,50257) # Getting the probabilities from the logits
+        # do top-k sampling of 50 (huggingface pipeline default)'
+        # topk_probs here becomes (5,50) and topk_indices becomes (5,50) where 50 is the number of tokens to sample from the vocabulary
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probnabilities
+        ix = torch.multinomial(topk_probs, 1) # (5,1) # Sampling a token from the top-k probabilities
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (5,1) # Getting the token from the top-k indices (B,1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1) # (5,9) # Appending the sampled token to the sequence
+
+
+# print the generated sequences
+for i in range(num__return_sequences):
+    tokens = x[i, :max_length].tolist() # Getting the tokens from the generated sequence
+    decode = enc.decode(tokens) # Decoding the tokens to get the text
+    print(">", decode)
+
 
 #     def configure_optimizers(self, weight_decay, learning_rate, device_type):
 #         # start with all of the candidate parameters (that require grad)

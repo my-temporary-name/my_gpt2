@@ -32,13 +32,13 @@ class CausalSelfAttention(nn.Module): # this class combined the self-attention m
         qkv = self.c_attn(x) # qkv is the query, key and value projections for all heads
         q,k,v = qkv.split(self.n_embd, dim=2) # Splitting the qkv into query, key and value projections
 
-        k = k.view(B,T,self.head, C//self.n_head).transpose(1,2) # Splitting the key into the number of heads and transposing it (B,nh,T,hs)
-        q = q.view(B,T,self.head, C//self.n_head).transpose(1,2) # Splitting the key into the number of heads and transposing it (B,nh,T,hs)
-        v = v.view(B,T,self.head, C//self.n_head).transpose(1,2) # Splitting the key into the number of heads and transposing it (B,nh,T,hs)
+        k = k.view(B,T,self.n_head, C//self.n_head).transpose(1,2) # Splitting the key into the number of heads and transposing it (B,nh,T,hs)
+        q = q.view(B,T,self.n_head, C//self.n_head).transpose(1,2) # Splitting the key into the number of heads and transposing it (B,nh,T,hs)
+        v = v.view(B,T,self.n_head, C//self.n_head).transpose(1,2) # Splitting the key into the number of heads and transposing it (B,nh,T,hs)
 
         # attention (materializes the large (T,T) matrix for all queries and keys)
         att = (q@k.transpose(-2,-1))*(1.0 / math.sqrt(k.size(-1))) # Multiplying the query and key and scaling it by the square root of the key size
-        att = att.masked_fill(self.bias[:,:,:T,:T]==0, float(-'inf')) # Masking the future tokens
+        att = att.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf')) # Masking the future tokens
         att = F.softmax(att, dim=-1) # Softmax over the last dimension
 
         y = att@v # Multiplying the attention weights with the values (B,nh,T,T) x (B,nh,T,hs) = (B,nh,T,hs)
@@ -108,6 +108,27 @@ class GPT(nn.Module): # Kind of skeleton of the model
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias = False) # language model head is a linear layer with vocab_size output
+    
+    def forward(self,idx): 
+        # idx is of shape [batch_size, sequence_length] (B,T)
+        B,T = idx.size() # batch size and sequence length
+        assert T<=self.config.block_size ,f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+
+        # forward the token and position embeddings
+        pos = torch.arange(0, T, dtype = torch.long, device =idx.device) # tensor of shape [T]
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B,T,n_embd)
+        x =tok_emb + pos_emb 
+
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        
+        # Forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        return logits 
+
 
 
     @classmethod
@@ -175,6 +196,53 @@ class GPT(nn.Module): # Kind of skeleton of the model
         return model # return the model with the pretrained weights
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+num__return_sequences = 5
+max_length = 30
+
+
 model = GPT.from_pretrained('gpt2') # Load the pretrained GPT2 model
 print("Model loaded successfully!")
-print(model)
+# print(model)
+
+model.eval() # Set the model to evaluation mode
+model.to('cuda')
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I am NLP student in IIT") 
+tokens = torch.tensor(tokens, dtype = torch.long) # (8,) # Encoding the input text
+tokens = tokens.unsqueeze(0).repeat(num__return_sequences, 1) # (5,8) # Repeating the input text for the number of sequences to generate
+x = tokens.to('cuda') # Moving the input to the GPU
+
+# Generate! right now x is (B,T) where B=5 and T=8
+# set see to 42
+torch.manual_seed(42)
+torch.cuda.manual_seed(42) 
+
+while x.size(1) < max_length: # Generate the tokens until the maximum length is reached
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits = model(x) # (5,8,50257) # Getting the logits from the model # (B,T, vocab_size)
+        # take logits as the last position
+        logits = logits[:, -1, :] # (5,50257) # Taking the logits of the last position # (B,vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1) # (5,50257) # Getting the probabilities from the logits
+        # do top-k sampling of 50 (huggingface pipeline default)'
+        # topk_probs here becomes (5,50) and topk_indices becomes (5,50) where 50 is the number of tokens to sample from the vocabulary
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probnabilities
+        ix = torch.multinomial(topk_probs, 1) # (5,1) # Sampling a token from the top-k probabilities
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (5,1) # Getting the token from the top-k indices (B,1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1) # (5,9) # Appending the sampled token to the sequence
+
+
+# print the generated sequences
+for i in range(num__return_sequences):
+    tokens = x[i, :max_length].tolist() # Getting the tokens from the generated sequence
+    decode = enc.decode(tokens) # Decoding the tokens to get the text
+    print(">", decode)
+
+
