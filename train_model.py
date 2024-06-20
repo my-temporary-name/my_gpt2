@@ -109,7 +109,7 @@ class GPT(nn.Module): # Kind of skeleton of the model
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias = False) # language model head is a linear layer with vocab_size output
     
-    def forward(self,idx): 
+    def forward(self,idx, targets= None): 
         # idx is of shape [batch_size, sequence_length] (B,T)
         B,T = idx.size() # batch size and sequence length
         assert T<=self.config.block_size ,f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -126,8 +126,11 @@ class GPT(nn.Module): # Kind of skeleton of the model
         
         # Forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-        return logits 
+        logits = self.lm_head(x) # (B,T,vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # Cross-entropy flattens out the 3D (B,T,vocab_size) tensor to 2D (B*T,vocab_size) tensor, It also flattens out the target tensor to 1D tensor
+        return logits , loss
 
 
 
@@ -196,16 +199,60 @@ class GPT(nn.Module): # Kind of skeleton of the model
         return model # return the model with the pretrained weights
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# attempt to autodetect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+    print("Using GPU")
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): # multi-precision support
+    device = "mps" # this is apple silicon (GPU)
+    print("Using MPS")
+print("Device: %s" %device)
+
+# device = 'cpu' # OVERRIDE
+
+# get a data batch
+import tiktoken
+enc = tiktoken.get_encoding('gpt2') # get the encoding for the gpt2 model (tokenizer)
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens= enc.encode(text)
+B,T = 4,32
+buf = torch.tensor(tokens[:B*T + 1])
+buf = buf.to(device)
+x = buf[:-1].view(B,T) # Input is the first T tokens in the sequence
+y = buf[1:].view(B,T) # Labels are the next token in the sequence
+
+# get logits
+model = GPT(GPTConfig())
+model.to(device)
+# logits, loss = model(x, y)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW is better than Adam for training transformers
+for i in range(50):
+    optimizer.zero_grad() # always start with zero gradients (otherwise they accumulate)
+    logits, loss = model(x, y)
+    loss.backward() # backpropagate to compute the gradients
+    optimizer.step() # update the weights of the model using the computed gradients and the optimizer 
+    print(f"iter {i}, loss: {loss.item()}") # loss is a single scalar tensor
+
+
+# print(logits.shape) # (4,32,50257) # (B,T,vocab_size)
+# print(loss) # -log(1/50257) = 10.82 --> we got tensor(10.8756, grad_fn=<NllLossBackward0>) which is close to 10.82
+import sys; sys.exit(0)
+
+#                                          1:2:00
 num__return_sequences = 5
 max_length = 30
 
 
-model = GPT.from_pretrained('gpt2') # Load the pretrained GPT2 model
+# model = GPT.from_pretrained('gpt2') # Load the pretrained GPT2 model
+model = GPT(GPTConfig()) # Initialize random weights
 print("Model loaded successfully!")
 # print(model)
-
 model.eval() # Set the model to evaluation mode
-model.to('cuda')
+model.to(device)
 
 # prefix tokens
 import tiktoken
@@ -213,7 +260,7 @@ enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I am NLP student in IIT") 
 tokens = torch.tensor(tokens, dtype = torch.long) # (8,) # Encoding the input text
 tokens = tokens.unsqueeze(0).repeat(num__return_sequences, 1) # (5,8) # Repeating the input text for the number of sequences to generate
-x = tokens.to('cuda') # Moving the input to the GPU
+x = tokens.to(device) # Moving the input to the GPU
 
 # Generate! right now x is (B,T) where B=5 and T=8
 # set see to 42
