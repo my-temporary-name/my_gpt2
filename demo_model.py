@@ -17,6 +17,8 @@ class CausalSelfAttention(nn.Module): # this class combined the self-attention m
                                                  # (so the embedding size should be divisible by the number of heads)
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd) # Linear layer for the query, key and value projections for all heads, but in batch
         self.c_proj = nn.Linear(config.n_embd, config.n_embd) # Linear layer for the final output projection
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # Scaling the initialization of the output projection
+        
         # Regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -57,6 +59,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd) # Fully connected layer for the first part of the MLP which takes the input and projects it to 4 times the size of the input
         self.gelu = nn.GELU(approximate='tanh') # GELU activation function
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd) # Fully connected layer for the second part of the MLP which projects the output of the previous layer to the original size
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # Scaling the initialization of the output projection
+
 
     def forward(self,x):
         x = self.c_fc(x)
@@ -108,6 +112,26 @@ class GPT(nn.Module): # Kind of skeleton of the model
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias = False) # language model head is a linear layer with vocab_size output
+
+        # Weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight # weight tying the token embeddings with the pre-softmax linear transformation, using this we saved 40m parameters
+
+        # init parameters
+        self.apply(self._init_weights) # initializing the weights of the model
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear): 
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2*self.config.n_layer)**-0.5 # scale by the number of layers
+            torch.nn.init.normal_(module.weight, mean=0.0, std = 0.2) # initializing the weights of the linear layer with normal distribution
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias) # initializing the bias of the linear layer with zeros
+        elif isinstance(module, nn.Embedding): 
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2) 
+
+
+
     
     def forward(self,idx, targets= None): 
         # idx is of shape [batch_size, sequence_length] (B,T)
@@ -199,6 +223,44 @@ class GPT(nn.Module): # Kind of skeleton of the model
         return model # return the model with the pretrained weights
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+import tiktoken
+class DataLoaderLite:
+    def __init__(self,B,T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens) 
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f" 1 epoch = {len(self.tokens)//(B*T)} batches")
+
+        #state
+        self.current_position = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T + 1] # +1 so we have both x and y
+        x = (buf[:-1].view(B,T)) # Input is the first T tokens in the sequence
+        y = (buf[1:].view(B,T)) # Labels are the next token in the sequence
+
+        # advance the position in tensor
+        self.current_position += B*T
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B*T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x,y
+
+
+
+
+# --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+import time
+
 # attempt to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
@@ -211,18 +273,16 @@ print("Device: %s" %device)
 
 # device = 'cpu' # OVERRIDE
 
-# get a data batch
-import tiktoken
-enc = tiktoken.get_encoding('gpt2') # get the encoding for the gpt2 model (tokenizer)
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens= enc.encode(text)
-B,T = 4,32
-buf = torch.tensor(tokens[:B*T + 1])
-buf = buf.to(device)
-x = buf[:-1].view(B,T) # Input is the first T tokens in the sequence
-y = buf[1:].view(B,T) # Labels are the next token in the sequence
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+
+# train_loader = DataLoaderLite(B=4, T=32) # batch size and sequence length
+train_loader = DataLoaderLite(B=8, T=1024) # batch size and sequence length
+
+torch.set_float32_matmul_precision('high') # 'high' is the default
+
 
 # get logits
 model = GPT(GPTConfig())
@@ -231,18 +291,29 @@ model.to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW is better than Adam for training transformers
 for i in range(50):
+    t0 = time.time()
+    x,y = train_loader.next_batch()
+    x,y = x.to(device), y.to(device)
+
     optimizer.zero_grad() # always start with zero gradients (otherwise they accumulate)
     logits, loss = model(x, y)
     loss.backward() # backpropagate to compute the gradients
     optimizer.step() # update the weights of the model using the computed gradients and the optimizer 
-    print(f"iter {i}, loss: {loss.item()}") # loss is a single scalar tensor
+
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # in milliseconds
+    # tokens per second
+    tokens_per_sec = (train_loader.B*train_loader.T) / dt
+
+    print(f"iter {i}, loss: {loss.item()}, dt: {dt:.2f}ms, token/sec: {tokens_per_sec:.2f}") # loss is a single scalar tensor
 
 
 # print(logits.shape) # (4,32,50257) # (B,T,vocab_size)
 # print(loss) # -log(1/50257) = 10.82 --> we got tensor(10.8756, grad_fn=<NllLossBackward0>) which is close to 10.82
 import sys; sys.exit(0)
 
-#                                          1:2:00
+#                                          1:40:00
 num__return_sequences = 5
 max_length = 30
 
