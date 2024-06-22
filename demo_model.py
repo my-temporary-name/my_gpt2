@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+# import torch._dynamo
+# torch._dynamo.config.suppress_errors = True
 
 # xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 # From original transformer model gpt2 only have decoder part and also the cross-attention is not used.
@@ -39,17 +41,26 @@ class CausalSelfAttention(nn.Module): # this class combined the self-attention m
         v = v.view(B,T,self.n_head, C//self.n_head).transpose(1,2) # Splitting the key into the number of heads and transposing it (B,nh,T,hs)
 
         # attention (materializes the large (T,T) matrix for all queries and keys)
-        att = (q@k.transpose(-2,-1))*(1.0 / math.sqrt(k.size(-1))) # Multiplying the query and key and scaling it by the square root of the key size
-        att = att.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf')) # Masking the future tokens
-        att = F.softmax(att, dim=-1) # Softmax over the last dimension
 
-        y = att@v # Multiplying the attention weights with the values (B,nh,T,T) x (B,nh,T,hs) = (B,nh,T,hs)
+        # att = (q@k.transpose(-2,-1))*(1.0 / math.sqrt(k.size(-1))) # Multiplying the query and key and scaling it by the square root of the key size
+        # att = att.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf')) # Masking the future tokens
+        # att = F.softmax(att, dim=-1) # Softmax over the last dimension
+        # y = att@v # Multiplying the attention weights with the values (B,nh,T,T) x (B,nh,T,hs) = (B,nh,T,hs)
+
+        # Attention on GPT2: ( matmul + mask + softmax + dropout + matmul ) ==> 15ms
+        # Flash Attention: Fused Kernel ==> 2.5ms
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1,2).contiguous().view(B,T,C) # re-assemble all head outputs side by side
 
         # Output Projection
         y = self.c_proj(y) # Projecting the output to the original size
         return y
 
+# class TanhGELU(nn.Module): # GELU activation function
+#     def forward(self,input):
+#         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 
 class MLP(nn.Module):
@@ -285,8 +296,12 @@ torch.set_float32_matmul_precision('high') # 'high' is the default
 
 
 # get logits
-model = GPT(GPTConfig())
+# model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) # instead of 50257, we have 50304 because 50304 is even number and 50257 is odd number
+
 model.to(device)
+model = torch.compile(model) # compile the model to TorchScript for faster execution ( it sees the entire code and optimizes it for the target device, in this case GPU)
+# Speedup mainly comes from reducing Python overhead and GPU read//writes
 # logits, loss = model(x, y)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # AdamW is better than Adam for training transformers
@@ -296,7 +311,9 @@ for i in range(50):
     x,y = x.to(device), y.to(device)
 
     optimizer.zero_grad() # always start with zero gradients (otherwise they accumulate)
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals())
     loss.backward() # backpropagate to compute the gradients
     optimizer.step() # update the weights of the model using the computed gradients and the optimizer 
 
@@ -313,7 +330,7 @@ for i in range(50):
 # print(loss) # -log(1/50257) = 10.82 --> we got tensor(10.8756, grad_fn=<NllLossBackward0>) which is close to 10.82
 import sys; sys.exit(0)
 
-#                                          1:40:00
+#                                          2:15:00
 num__return_sequences = 5
 max_length = 30
 
