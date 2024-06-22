@@ -264,9 +264,11 @@ class GPT(nn.Module): # Kind of skeleton of the model
 # --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 import tiktoken
 class DataLoaderLite:
-    def __init__(self,B,T):
+    def __init__(self,B,T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them in memory
         with open('input.txt', 'r') as f:
@@ -276,10 +278,11 @@ class DataLoaderLite:
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens) 
         print(f"loaded {len(self.tokens)} tokens")
-        print(f" 1 epoch = {len(self.tokens)//(B*T)} batches")
+        # print(f" 1 epoch = {len(self.tokens)//(B*T)} batches")
+
 
         #state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank # start at the beginning of the process's allocated tokens
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -288,10 +291,10 @@ class DataLoaderLite:
         y = (buf[1:].view(B,T)) # Labels are the next token in the sequence
 
         # advance the position in tensor
-        self.current_position += B*T
+        self.current_position += B*T*self.num_processes
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B*T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B*T*self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x,y
 
 
@@ -299,16 +302,57 @@ class DataLoaderLite:
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 import time
+import os
 
 # attempt to autodetect the device
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-    print("Using GPU")
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): # multi-precision support
-    device = "mps" # this is apple silicon (GPU)
-    print("Using MPS")
-print("Device: %s" %device)
+# device = "cpu"
+# if torch.cuda.is_available():
+#     device = "cuda"
+#     print("Using GPU")
+# elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): # multi-precision support
+#     device = "mps" # this is apple silicon (GPU)
+#     print("Using MPS")
+# print("Device: %s" %device)
+
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# -----------------------------------------------------------------------------
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+# torchrun --standalone train_gpt2.py # when using the default 1 GPU
+# 
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 # device = 'cpu' # OVERRIDE
 
@@ -316,9 +360,19 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens as given in the paper of GPT-3 (0.5M tokens per batch)
+B = 8 # micro batch size
+T = 1024 # sequence length
 
-# train_loader = DataLoaderLite(B=4, T=32) # batch size and sequence length
-train_loader = DataLoaderLite(B=8, T=1024) # batch size and sequence length
+assert total_batch_size % (B*T*ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T"
+grad_acum_steps = total_batch_size // (B*T*ddp_world_size) # number of steps to accumulate gradients over
+if master_process:
+    print(f"Total desired batch size: {total_batch_size}")
+    print(f"==> Calculate gradient accumulation steps: {grad_acum_steps}")
+
+
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank = ddp_rank, num_processes = ddp_world_size) # DataLoaderLite object with batch size B and sequence length T
 
 torch.set_float32_matmul_precision('high') # 'high' is the default
 
@@ -331,7 +385,8 @@ model.to(device)
 model = torch.compile(model) # compile the model to TorchScript for faster execution ( it sees the entire code and optimizes it for the target device, in this case GPU)
 # Speedup mainly comes from reducing Python overhead and GPU read//writes
 # logits, loss = model(x, y)
-
+if ddp: # if using DDP, wrap the model in DDP
+    model = DDP(model, device_ids=[ddp_local_rank]) # DDP model with device id as ddp_local_rank
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10 # number of steps to linearly increase the learning rate
@@ -356,14 +411,18 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for step in range(50):
     t0 = time.time()
-    x,y = train_loader.next_batch()
-    x,y = x.to(device), y.to(device)
-
     optimizer.zero_grad() # always start with zero gradients (otherwise they accumulate)
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-        # import code; code.interact(local=locals())
-    loss.backward() # backpropagate to compute the gradients
+    loss_accum = 0.0
+    for micro_steps in range(grad_acum_steps):
+        x,y = train_loader.next_batch()
+        x,y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+            # import code; code.interact(local=locals())
+        loss = loss / grad_acum_steps # scale the loss to average over the batch
+        loss_accum += loss.detach() # accumulate the loss
+        loss.backward() # backpropagate to compute the gradients
+    
     norm = torch.nn.utils.clip_grad_norm_(model.parameters() ,1.0) # clip the gradients to prevent them from exploding (norm is the total norm of the gradients)
 
     # determine and set the learning rate for this iteration
@@ -386,7 +445,7 @@ for step in range(50):
 # print(loss) # -log(1/50257) = 10.82 --> we got tensor(10.8756, grad_fn=<NllLossBackward0>) which is close to 10.82
 import sys; sys.exit(0)
 
-#                                          2:35:00
+#                                          3:00:00
 num__return_sequences = 5
 max_length = 30
 
