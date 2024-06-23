@@ -277,7 +277,8 @@ class DataLoaderLite:
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens) 
-        print(f"loaded {len(self.tokens)} tokens")
+        if master_process:
+            print(f"loaded {len(self.tokens)} tokens")
         # print(f" 1 epoch = {len(self.tokens)//(B*T)} batches")
 
 
@@ -387,6 +388,7 @@ model = torch.compile(model) # compile the model to TorchScript for faster execu
 # logits, loss = model(x, y)
 if ddp: # if using DDP, wrap the model in DDP
     model = DDP(model, device_ids=[ddp_local_rank]) # DDP model with device id as ddp_local_rank
+raw_model = model.module if ddp else model # if using DDP, raw_model is the model.module, otherwise raw_model is the model (always contains the "raw" unwrapped model)
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10 # number of steps to linearly increase the learning rate
@@ -407,13 +409,13 @@ def get_lr(it):
 
 
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps = 1e-8) # AdamW is better than Adam for training transformers
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device) 
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device) 
 
 for step in range(50):
     t0 = time.time()
     optimizer.zero_grad() # always start with zero gradients (otherwise they accumulate)
     loss_accum = 0.0
-    for micro_steps in range(grad_acum_steps):
+    for micro_step in range(grad_acum_steps):
         x,y = train_loader.next_batch()
         x,y = x.to(device), y.to(device)
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
@@ -421,8 +423,12 @@ for step in range(50):
             # import code; code.interact(local=locals())
         loss = loss / grad_acum_steps # scale the loss to average over the batch
         loss_accum += loss.detach() # accumulate the loss
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_acum_steps -1)
         loss.backward() # backpropagate to compute the gradients
-    
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # average the loss over all processes
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters() ,1.0) # clip the gradients to prevent them from exploding (norm is the total norm of the gradients)
 
     # determine and set the learning rate for this iteration
@@ -436,10 +442,14 @@ for step in range(50):
     t1 = time.time()
     dt = (t1 - t0) * 1000 # in milliseconds
     # tokens per second
-    tokens_per_sec = (train_loader.B*train_loader.T) / dt
+    tokens_processed = train_loader.B * train_loader.T * grad_acum_steps
+    tokens_per_sec = tokens_processed / dt  # number of tokens processed per second
+    if master_process:
+        print(f"iter: {step} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | token/sec: {tokens_per_sec:.2f}") # loss is a single scalar tensor
 
-    print(f"iter: {step} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | token/sec: {tokens_per_sec:.2f}") # loss is a single scalar tensor
 
+if ddp:
+    destroy_process_group() # clean up the process group
 
 # print(logits.shape) # (4,32,50257) # (B,T,vocab_size)
 # print(loss) # -log(1/50257) = 10.82 --> we got tensor(10.8756, grad_fn=<NllLossBackward0>) which is close to 10.82
