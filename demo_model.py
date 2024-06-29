@@ -113,7 +113,7 @@ class GPTConfig:
     block_size: int = 256 # maximum sequence length
     vocab_size: int = 50257 # number of tokens in the vocabulary i.e. 50,000 BPE merges + 256 byte tokens + 1 <|endoftext|> token
     n_layer: int = 6 # number of transformer layers
-    n_head: int = 12 # number of heads in the multi-head attention mechanism
+    n_head: int = 6 # number of heads in the multi-head attention mechanism
     n_embd: int = 768 # embedding dimension of each token
 
 class GPT(nn.Module): # Kind of skeleton of the model
