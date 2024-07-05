@@ -4,10 +4,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import inspect
+from transformers import GPT2LMHeadModel
 # import torch._dynamo
 # torch._dynamo.config.suppress_errors = True
 
-# xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 # From original transformer model gpt2 only have decoder part and also the cross-attention is not used.
 # Also there's reshuffling layer-norms and Additional Layer normalization is added right before the soft-max layer.
 
@@ -96,7 +97,11 @@ class Block(nn.Module):
     # forward pass of the block, the input x is the sequence of embeddings and return is the updated sequence of embeddings
     def forward(self,x):
         x = x + self.attn(self.ln_1(x)) # residual connection followed by self-attention
+        # Our text first goes to ln_1, then to the self-attention mechanism, then to ln_2, and finally to the MLP
         x = x + self.mlp(self.ln_2(x)) # residual connection followed by MLP (ffn)
+
+        # In attention 1024 sequence lined up communicated with each other & exchange info.
+        # Whereas MLP happens to every single token individually and there's no communication between tokens or exchange of information between tokens.
 
         return x
 
@@ -182,7 +187,6 @@ class GPT(nn.Module): # Kind of skeleton of the model
         """Load pretrained GPT2 model weights from huggingface"""
 
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'} # Checking if the model type is valid
-        from transformers import GPT2LMHeadModel
         print("Loading weights from pretrained gpt: %s" %model_type)
 
         # n_layer, n_head, and n_embd are determined by the model type
@@ -373,7 +377,7 @@ total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens as given in the pa
 # T = 1024 # sequence length
 
 # changed B,T
-B = 32
+B = 64
 T = 256
 
 print(f"total batch size: {total_batch_size}, B: {B}, T: {T}")
