@@ -177,7 +177,8 @@ class GPT(nn.Module): # Kind of skeleton of the model
         logits = self.lm_head(x) # (B,T,vocab_size)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # Cross-entropy flattens out the 3D (B,T,vocab_size) tensor to 2D (B*T,vocab_size) tensor, It also flattens out the target tensor to 1D tensor
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # Cross-entropy flattens out the 3D (B,T,vocab_size) tensor to 2D 
+                                                                                        # (B*T,vocab_size) tensor, It also flattens out the target tensor to 1D tensor
         return logits , loss
 
 
@@ -274,27 +275,52 @@ class GPT(nn.Module): # Kind of skeleton of the model
 
 # --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 import tiktoken
+import numpy as np
+
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
 class DataLoaderLite:
-    def __init__(self,B,T, process_rank, num_processes):
+    def __init__(self,B,T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {'train', 'val'}
 
-        # at init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens) 
+        # get the shard filenames
+        data_root = "ultra_textbooks"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no {split} shards found in {data_root}"
         if master_process:
-            print(f"loaded {len(self.tokens)} tokens")
+            print(f"found {len(shards)} shards for split '{split}'")
+        self.reset() # reset the state of the data loader
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank # start at the beginning of the process's allocated tokens
+
+        # # at init load tokens from disk and store them in memory
+        # with open('input.txt', 'r') as f:
+        #     text = f.read()
+        
+        # enc = tiktoken.get_encoding('gpt2')
+        # tokens = enc.encode(text)
+        # self.tokens = torch.tensor(tokens) 
+        # if master_process:
+        #     print(f"loaded {len(self.tokens)} tokens")
         # print(f" 1 epoch = {len(self.tokens)//(B*T)} batches")
 
-
         #state
-        self.current_position = self.B * self.T * self.process_rank # start at the beginning of the process's allocated tokens
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -377,7 +403,7 @@ total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens as given in the pa
 # T = 1024 # sequence length
 
 # changed B,T
-B = 64
+B = 32
 T = 256
 
 print(f"total batch size: {total_batch_size}, B: {B}, T: {T}")
@@ -390,7 +416,8 @@ if master_process:
 
 
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank = ddp_rank, num_processes = ddp_world_size) # DataLoaderLite object with batch size B and sequence length T
+train_loader = DataLoaderLite(B=B, T=T, process_rank = ddp_rank, num_processes = ddp_world_size, split="train") # DataLoaderLite object with batch size B and sequence length T
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val") # DataLoaderLite object with batch size B and sequence length T
 
 torch.set_float32_matmul_precision('high') # 'high' is the default
 
@@ -400,7 +427,14 @@ torch.set_float32_matmul_precision('high') # 'high' is the default
 model = GPT(GPTConfig(vocab_size=50304)) # instead of 50257, we have 50304 because 50304 is even number and 50257 is odd number
 
 model.to(device)
-model = torch.compile(model) # compile the model to TorchScript for faster execution ( it sees the entire code and optimizes it for the target device, in this case GPU)
+# model = torch.compile(model) # compile the model to TorchScript for faster execution ( it sees the entire code and optimizes it for the target device, in this case GPU)
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+
+if use_compile:
+    model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 # Speedup mainly comes from reducing Python overhead and GPU read//writes
 # logits, loss = model(x, y)
 if ddp: # if using DDP, wrap the model in DDP
@@ -408,8 +442,8 @@ if ddp: # if using DDP, wrap the model in DDP
 raw_model = model.module if ddp else model # if using DDP, raw_model is the model.module, otherwise raw_model is the model (always contains the "raw" unwrapped model)
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10 # number of steps to linearly increase the learning rate
-max_steps = 50 # total number of steps to train for
+warmup_steps = 715 # number of steps to linearly increase the learning rate
+max_steps = 19073 # total number of steps to train for
 
 def get_lr(it):
     # 1. Linear warmup  for warmup_iters steps
@@ -428,8 +462,37 @@ def get_lr(it):
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps = 1e-8) # AdamW is better than Adam for training transformers
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device) 
 
-for step in range(50):
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
+
+for step in range(max_steps):
     t0 = time.time()
+
+    # once in a while evaluate our validation loss
+    if step%50 == 0:
+        model.eval()
+        with torch.no_grad(): # no need to compute gradients during validation
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device) , y.to(device)
+                with torch.autocast(device_type=device, dtype = torch.bfloat16):
+                    logits, loss = model(x , y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp: # if using DDP, average the loss over all processes
+            dist.all_reduce(val_loss_accum , op = dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+    # set the model to training mode
+    model.train() 
     optimizer.zero_grad() # always start with zero gradients (otherwise they accumulate)
     loss_accum = 0.0
     for micro_step in range(grad_acum_steps):
@@ -472,7 +535,7 @@ if ddp:
 # print(loss) # -log(1/50257) = 10.82 --> we got tensor(10.8756, grad_fn=<NllLossBackward0>) which is close to 10.82
 import sys; sys.exit(0)
 
-#                                          3:18:00
+#                                          --till log--
 num__return_sequences = 5
 max_length = 30
 
