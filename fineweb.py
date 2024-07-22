@@ -6,13 +6,13 @@ import tiktoken
 from tqdm import tqdm
 
 # Constants and Local Directory Setup
-local_dir = "ultra_textbooks"
+local_dir = "ultra2"
 shard_size = int(1e8)  # 100M tokens per shard
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # Load CSV File
-data_path = os.path.join(os.path.dirname(__file__), 'train_1.csv')
+data_path = os.path.join(os.path.dirname(__file__), 'ultra2_data.csv')
 df = pd.read_csv(data_path)
 
 # Initialize the tokenizer
@@ -46,7 +46,7 @@ with mp.Pool(nprocs) as pool:
             progress_bar.update(len(tokens))
         else:
             split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"shakespeare_{split}_{shard_index:06d}.npy")
+            filename = os.path.join(DATA_CACHE_DIR, f"ultra2_{split}_{shard_index:06d}.npy")
             remainder = shard_size - token_count
             progress_bar.update(remainder)
             all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
@@ -58,6 +58,6 @@ with mp.Pool(nprocs) as pool:
 
     if token_count != 0:
         split = "val" if shard_index == 0 else "train"
-        filename = os.path.join(DATA_CACHE_DIR, f"shakespeare_{split}_{shard_index:06d}.npy")
+        filename = os.path.join(DATA_CACHE_DIR, f"ultra2_{split}_{shard_index:06d}.npy")
         write_datafile(filename, all_tokens_np[:token_count])
 
